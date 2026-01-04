@@ -79,13 +79,15 @@ class GenericLightBridge(HassMqttBridge):
         """
         message = {"state": "ON" if onoff else "OFF"}
 
-        if onoff and node.supports(Light.BrightnessProperty):
+        if node.supports(Light.BrightnessProperty):
             message["brightness"] = (
                 int(node.retained(Light.BrightnessProperty, BLE_MESH_MAX_LIGHTNESS)) / self.brightness_max * 100
             )
 
-        if onoff and node.supports(Light.TemperatureProperty):
-            message["color_temp"] = node.retained(Light.TemperatureProperty, BLE_MESH_MAX_TEMPERATURE)
+        if node.supports(Light.TemperatureProperty):
+            kelvin = node.retained(Light.TemperatureProperty, BLE_MESH_MAX_TEMPERATURE)
+            message["color_temp"] = node.kelvin_to_mireds(kelvin)
+            message["color_mode"] = "color_temp"
 
         await self._messenger.publish(self.component, node, "state", message, retain=True)
 
@@ -113,6 +115,11 @@ class GenericLightBridge(HassMqttBridge):
 
     async def _notify_brightness(self, node, brightness):
         await self._state(node, brightness > 0)
+
+    async def _notify_temperature(self, node, _kelvin):
+        # reuse retained state so HA sees the updated color temperature without forcing ON/OFF changes
+        onoff = bool(node.retained(Light.OnOffProperty, False))
+        await self._state(node, onoff)
 
     async def _notify_availability(self, node, state):
         await self._messenger.publish(self.component, node, "availability", state)

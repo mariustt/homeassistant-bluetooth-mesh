@@ -94,8 +94,8 @@ class HassMqttMessenger:
 
                 tasks.spawn(bridge.listen(node), f"bridge {node}")
 
-            # global subscription to messages
-            await self._client.subscribe("homeassistant/#")
+            # subscribe only to Home Assistant SET command topics
+            await self._client.subscribe("homeassistant/+/+/+/set")
 
             # wait for all tasks
             await tasks.gather()

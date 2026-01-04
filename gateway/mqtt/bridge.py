@@ -42,6 +42,9 @@ class HassMqttBridge:
         # send node configuration for MQTT discovery
         await node.ready.wait()
         await self.config(node)
+        if hasattr(node, "refresh_state"):
+            # trigger an initial poll so retained values reflect the real device state (after restarts)
+            await node.refresh_state()
 
         # listen for node changes (this will also push the initial state)
         node.subscribe(self._property_change, resend=True)

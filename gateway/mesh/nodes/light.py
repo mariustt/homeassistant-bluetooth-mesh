@@ -39,10 +39,63 @@ class Light(Generic):
         super().__init__(*args, **kwargs)
 
         self._features = set()
+        self._availability_failures = 0
+        self._availability_state = None
+        self._availability_threshold = max(1, self.config.optional("availability_failures", 3))
+
+    def _mired_limits(self):
+        min_mired = int(self.config.optional("mireds_min", BLE_MESH_MIN_MIRED))
+        max_mired = int(self.config.optional("mireds_max", BLE_MESH_MAX_MIRED))
+        if min_mired > max_mired:
+            logging.warning(f"{self}: swapping mired limits ({min_mired} > {max_mired})")
+            min_mired, max_mired = max_mired, min_mired
+        min_mired = max(1, min_mired)
+        max_mired = max(min_mired, max_mired)
+        return min_mired, max_mired
+
+    def _kelvin_limits(self):
+        min_mired, max_mired = self._mired_limits()
+        min_kelvin = max(BLE_MESH_MIN_TEMPERATURE, int(1e6 / max_mired))
+        max_kelvin = min(BLE_MESH_MAX_TEMPERATURE, int(1e6 / min_mired))
+        if min_kelvin > max_kelvin:
+            min_kelvin, max_kelvin = max_kelvin, min_kelvin
+        return min_kelvin, max_kelvin
+
+    def _clamp_kelvin(self, kelvin):
+        min_kelvin, max_kelvin = self._kelvin_limits()
+        if kelvin < min_kelvin:
+            return min_kelvin
+        if kelvin > max_kelvin:
+            return max_kelvin
+        return kelvin
+
+    def kelvin_to_mireds(self, kelvin):
+        min_mired, max_mired = self._mired_limits()
+        if kelvin <= 0:
+            return max_mired
+        mired = int(round(1e6 / kelvin))
+        if mired < min_mired:
+            return min_mired
+        if mired > max_mired:
+            return max_mired
+        return mired
 
     def supports(self, property):  # pylint: disable=redefined-builtin
         logging.debug(f"Supports: {self._features}")
         return property in self._features
+
+    def _availability_success(self):
+        self._availability_failures = 0
+        if self._availability_state != "online":
+            self._availability_state = "online"
+            self.notify("availability", "online")
+
+    def _availability_failure(self):
+        self._availability_failures += 1
+        if self._availability_failures >= self._availability_threshold:
+            if self._availability_state != "offline":
+                self._availability_state = "offline"
+                self.notify("availability", "offline")
 
     async def turn_on(self, ack=False):
         if not ack:
@@ -61,7 +114,7 @@ class Light(Generic):
             destination,
             message):
         if (self.unicast == source):
-            self.notify("availability", "online")
+            self._availability_success()
             self.notify(Light.BrightnessProperty, message["light_lightness_status"]["present_lightness"])
 
 
@@ -88,25 +141,31 @@ class Light(Generic):
 
     async def mireds_to_kelvin(self, temperature, ack=False, is_tuya=False):
         if self._is_model_bound(models.LightCTLServer):
-            kelvin = 1000000 // temperature
+            kelvin = max(1, 1000000 // temperature)
+            kelvin = self._clamp_kelvin(kelvin)
             logging.info(f"{temperature} mired = {kelvin} Kelvin")
             if not ack:
                 await self.set_ctl_unack(temperature=kelvin, is_tuya=is_tuya)
             else:
                 await self.set_ctl(temperature=kelvin, is_tuya=is_tuya)
 
-    def kelvin_to_tuya_level(self, temperature):
-        if self._is_model_bound(models.LightCTLServer):
-            kelvin = 1000000 // temperature
-            logging.info(f"{temperature} mired = {kelvin} Kelvin")
+    def kelvin_to_tuya_level(self, kelvin: int) -> int:
+        """
+        Map real kelvin range (derived from mireds_min/max) to mesh CTL temperature range [800..20000].
+        Intended for Tuya-style devices that expect CTL temperature in that normalized range.
+        """
+        min_kelvin, max_kelvin = self._kelvin_limits()
+        kelvin = self._clamp_kelvin(kelvin)
+        if max_kelvin == min_kelvin:
+            return BLE_MESH_MIN_TEMPERATURE
 
-            max_kelvin = 1e6 / self.config.optional("mireds_min", BLE_MESH_MIN_MIRED)
-            min_kelvin = 1e6 / self.config.optional("mireds_max", BLE_MESH_MAX_MIRED)
-
-            tuya_level = (temperature - min_kelvin) * (BLE_MESH_MAX_TEMPERATURE - BLE_MESH_MIN_TEMPERATURE) // (
-                max_kelvin - min_kelvin
-            ) + BLE_MESH_MIN_TEMPERATURE
-            return int(tuya_level)
+        tuya_level = (
+            (kelvin - min_kelvin)
+            * (BLE_MESH_MAX_TEMPERATURE - BLE_MESH_MIN_TEMPERATURE)
+            / (max_kelvin - min_kelvin)
+            + BLE_MESH_MIN_TEMPERATURE
+        )
+        return int(round(tuya_level))
 
     async def bind(self, app):
         await super().bind(app)
@@ -131,6 +190,14 @@ class Light(Generic):
         client.app_message_callbacks[LightLightnessOpcode.LIGHT_LIGHTNESS_STATUS] \
             .add(self.lightness_cb)
 
+    async def refresh_state(self):
+        if self.supports(Light.OnOffProperty):
+            await self.get_onoff()
+        if self.supports(Light.BrightnessProperty):
+            await self.get_lightness()
+        if self.supports(Light.TemperatureProperty):
+            await self.get_ctl()
+
     async def set_onoff_unack(self, onoff, **kwargs):
         self.notify(Light.OnOffProperty, onoff)
         client = self._app.elements[0][models.GenericOnOffClient]
@@ -143,14 +210,20 @@ class Light(Generic):
 
     async def get_availability(self):
         client = self._app.elements[0][models.GenericOnOffClient]
-        state = await client.get_light_status([self.unicast], self._app.app_keys[0][0])
+        try:
+            state = await client.get_light_status([self.unicast], self._app.app_keys[0][0])
+        except Exception as err:  # pylint: disable=broad-except
+            logging.warning(f"Availability poll failed for {self}: {err}")
+            self._availability_failure()
+            return
 
-        result = state[self.unicast]
-        if result is None:
-            logging.warn(f"Received invalid result {state}")
-            self.notify("availability", "offline")
-        elif not isinstance(result, BaseException):
-            self.notify("availability", "online")
+        result = (state or {}).get(self.unicast)
+        if result is None or isinstance(result, BaseException):
+            logging.warning(f"Received invalid availability result for {self}: {state}")
+            self._availability_failure()
+            return
+
+        self._availability_success()
 
     async def get_onoff(self):
         client = self._app.elements[0][models.GenericOnOffClient]
@@ -203,10 +276,8 @@ class Light(Generic):
             logging.info(f"Get Lightness Range: {state}")
 
     async def set_ctl_unack(self, temperature=None, brightness=None, is_tuya=False, **kwargs):
-        if temperature and temperature < BLE_MESH_MIN_TEMPERATURE:
-            temperature = BLE_MESH_MIN_TEMPERATURE
-        elif temperature and temperature > BLE_MESH_MAX_TEMPERATURE:
-            temperature = BLE_MESH_MAX_TEMPERATURE
+        if temperature:
+            temperature = self._clamp_kelvin(temperature)
         if brightness and brightness > BLE_MESH_MAX_LIGHTNESS:
             brightness = BLE_MESH_MAX_LIGHTNESS
 
@@ -216,38 +287,37 @@ class Light(Generic):
             temperature = self.retained(Light.TemperatureProperty, BLE_MESH_MAX_TEMPERATURE)
 
         if brightness:
-            self.notify(Light.BrightnessProperty, temperature)
+            self.notify(Light.BrightnessProperty, brightness)
         else:
             brightness = self.retained(Light.BrightnessProperty, BLE_MESH_MAX_LIGHTNESS)
 
+        ctl_temperature = self.kelvin_to_tuya_level(temperature) if is_tuya else temperature
+
         if is_tuya:
-            temperature = self.kelvin_to_tuya_level(temperature)
+            logging.debug(f"{self} -> Tuya CTL {temperature}K => {ctl_temperature}")
 
         client = self._app.elements[0][models.LightCTLClient]
         await client.set_ctl_unack(
             destination=self.unicast,
             app_index=self._app.app_keys[0][0],
-            ctl_temperature=temperature,
+            ctl_temperature=ctl_temperature,
             ctl_lightness=brightness,
             **kwargs,
         )
 
     async def set_ctl(self, temperature=None, is_tuya=False, **kwargs):
-        if temperature and temperature < BLE_MESH_MIN_TEMPERATURE:
-            temperature = BLE_MESH_MIN_TEMPERATURE
-        elif temperature and temperature > BLE_MESH_MAX_TEMPERATURE:
-            temperature = BLE_MESH_MAX_TEMPERATURE
+        if temperature:
+            temperature = self._clamp_kelvin(temperature)
 
         if temperature:
             self.notify(Light.TemperatureProperty, temperature)
         else:
             temperature = self.retained(Light.TemperatureProperty, BLE_MESH_MAX_TEMPERATURE)
 
-        if is_tuya:
-            temperature = self.kelvin_to_tuya_level(temperature)
+        ctl_temperature = self.kelvin_to_tuya_level(temperature) if is_tuya else temperature
 
         client = self._app.elements[0][models.LightCTLClient]
-        await client.set_ctl([self.unicast], self._app.app_keys[0][0], ctl_temperature=temperature, **kwargs)
+        await client.set_ctl([self.unicast], self._app.app_keys[0][0], ctl_temperature=ctl_temperature, **kwargs)
 
     async def get_ctl(self):
         client = self._app.elements[0][models.LightCTLClient]

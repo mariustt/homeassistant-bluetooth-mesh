@@ -19,11 +19,10 @@ WORKDIR /opt/build
 COPY docker/scripts/install-json-c.sh .
 RUN sh ./install-json-c.sh
 
-# install bridge
+# # build hass-ble-mesh
 WORKDIR /opt/hass-ble-mesh
-RUN git clone https://github.com/minims/homeassistant-bluetooth-mesh.git .
-RUN git checkout master
-RUN pip3 install -r requirements.txt
+COPY . .
+RUN pip3 install --upgrade pip && pip3 install "cython<3.0.0" wheel && pip install "pyyaml==6.0" --no-build-isolation && pip3 install -r requirements.txt
 
 WORKDIR /opt/hass-ble-mesh
 COPY ./gateway gateway
@@ -35,5 +34,5 @@ ENV GATEWAY_BASEDIR=/var/lib/bluetooth/mesh
 
 # run bluetooth service and bridge
 WORKDIR /opt/hass-ble-mesh/gateway
-COPY ./scripts/entrypoint.sh .
+COPY ./docker/scripts/entrypoint.sh .
 ENTRYPOINT [ "/bin/bash", "entrypoint.sh" ]
